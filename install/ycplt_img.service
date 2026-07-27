@@ -1,0 +1,24 @@
+[Unit]
+Description=ycplt_img - local image generation service (stable-diffusion.cpp)
+After=network.target
+
+[Service]
+Type=simple
+#User=ycplt
+WorkingDirectory=/opt/ycplt_img
+
+# Same file as .env used for a manual `python app.py` run — systemd loads it
+# straight into the process environment, so conf/config.py picks it up via
+# os.environ without even touching its own .env parser. Switch models by
+# editing MODEL= in this file only, then `systemctl restart ycplt_img`.
+EnvironmentFile=/opt/ycplt_img/.env
+
+ExecStart=/opt/ycplt_img/.venv/bin/python /opt/ycplt_img/app.py
+Restart=on-failure
+RestartSec=5
+
+# Generation is a heavy CPU/RAM job that can run for many minutes; don't kill on timeout.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
