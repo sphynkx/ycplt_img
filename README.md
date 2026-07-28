@@ -37,7 +37,8 @@ models/
 ```bash
 sudo dnf install -y gcc gcc-c++ cmake git python3
 
-git clone <repository-url-tbd> ycplt_img
+cd /opt
+git clone https://github.com/sphynkx/ycplt_img
 cd ycplt_img
 
 python3 -m venv .venv
