@@ -31,6 +31,9 @@ def run_worker() -> None:
             if job["mode"] == "caption":
                 text = _caption(job)
                 db.mark_done_text(job["id"], text)
+            elif job["mode"] == "img2img" and job.get("remove_target"):
+                image_bytes = _generate_removal_edit(job)
+                db.mark_done(job["id"], image_bytes)
             else:
                 image_bytes = _generate(job)
                 db.mark_done(job["id"], image_bytes)
@@ -79,6 +82,57 @@ def _caption(job) -> str:
         ],
     )
     return response["choices"][0]["message"]["content"]
+
+
+def _generate_removal_edit(job) -> bytes:
+    """mode="img2img" with remove_target set (see routes/chat.py and
+    utils/intent.get_removal_target_async on the main app side): plain
+    img2img has no mechanism to execute a "remove X" instruction — it just
+    partially re-renders the whole image guided by the prompt text, so the
+    named object doesn't actually disappear, it just gets restyled.
+
+    Instead: CLIPSeg (conf/segmentation.py) finds a mask for the named
+    object from its English name alone — no manual mask needed — then the
+    inpainting-tuned checkpoint (conf/models.py's "inpaint" slot) repaints
+    just that region. A high strength is used deliberately: for removal we
+    want the masked region fully replaced, not lightly retouched.
+    """
+    from PIL import Image
+    from conf import segmentation
+
+    if not job["init_image"]:
+        raise RuntimeError("mode='img2img' with remove_target requires init_image")
+
+    init_image = Image.open(io.BytesIO(job["init_image"]))
+    mask = segmentation.get_mask(init_image, job["remove_target"])
+    if mask is None:
+        seg_status = segmentation.status()
+        raise RuntimeError(
+            "automatic object segmentation unavailable: "
+            + (seg_status["load_error"] or "CLIPSeg not installed — see requirements.txt")
+        )
+
+    stable_diffusion = models.get_model_for_mode("inpaint")
+    kwargs = dict(
+        prompt=f"empty background, seamless, natural, no {job['remove_target']}",
+        negative_prompt=job["remove_target"],
+        init_image=init_image,
+        mask_image=mask,
+        strength=0.95,
+        width=job["width"],
+        height=job["height"],
+        sample_steps=job["steps"],
+        cfg_scale=job["cfg_scale"],
+    )
+    if job["seed"] is not None:
+        kwargs["seed"] = job["seed"]
+
+    output = stable_diffusion.generate_image(**kwargs)
+    image = output[0]
+
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _generate(job) -> bytes:

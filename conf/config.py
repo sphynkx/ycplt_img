@@ -81,6 +81,16 @@ VISION_MMPROJ_PATH = (
 
 VISION_N_CTX = int(os.environ.get("YCPLT_VISION_N_CTX", "2048"))
 
+# Automatic object segmentation (CLIPSeg) for mode="img2img" jobs carrying
+# a remove_target (see conf/segmentation.py and README "Removing a named
+# object"). Unlike every other model here, this one isn't a GGUF file you
+# download manually — it's pulled automatically from the Hugging Face Hub
+# the first time it's needed (via the `transformers` library) and cached
+# locally, the same way ycplt's own RAG feature already auto-downloads its
+# sentence-transformers embedding model. Requires internet access on first
+# use only; after that it's cached and works offline.
+CLIPSEG_MODEL = os.environ.get("CLIPSEG_MODEL", "CIDAS/clipseg-rd64-refined")
+
 # Job queue
 DB_PATH = os.environ.get("YCPLT_DB_PATH", "data/jobs.sqlite3")
 

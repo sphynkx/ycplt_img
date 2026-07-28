@@ -19,6 +19,8 @@ app.py                    — entry point: preloads the default model, starts th
 conf/
   config.py                 — configuration via environment variables (host/port, model path, TTL, ...)
   models.py                  — model factory: picks/lazily loads the right checkpoint per job mode
+                               (also the vision/caption model, moondream2 via llama-cpp-python)
+  segmentation.py             — CLIPSeg: automatic object masks for "remove X" edits (mode="img2img" + remove_target)
 db/
   db.py                      — SQLite job queue (schema, CRUD, TTL purge)
 srv/
@@ -203,6 +205,41 @@ that it stays resident like every other model here. Check `GET /health`'s
 keeps failing — it tells apart "files not downloaded" from "files present
 but the model failed to load" without needing to read server logs.
 
+## Removing a named object
+
+Real instruction-following edit models exist for stable-diffusion.cpp
+(FLUX.1-Kontext-dev, Qwen-Image-Edit — see their docs upstream), but both
+pair a 12-20B parameter diffusion model with a separate multi-GB text
+encoder (t5xxl or a 7B Qwen VLM), totaling ~15-20GB and built for GPU
+inference — impractical on a CPU-only box like this one. So "remove X"
+instructions (`mode="img2img"` with `remove_target` set — see the main
+chat app's `utils/intent.get_removal_target_async`) instead use automatic
+segmentation + the existing inpainting checkpoint, both already
+CPU-sized:
+
+1. [CLIPSeg](https://huggingface.co/CIDAS/clipseg-rd64-refined)
+   (`conf/segmentation.py`) takes the object's English name alone (e.g.
+   "cat") and produces a mask — no manually-drawn mask needed, unlike
+   ordinary `mode="inpaint"` jobs.
+2. That mask is inpainted with the `inpaint` slot's checkpoint (see
+   "Editing and inpainting models" above) at a high `strength` (0.95) —
+   deliberately close to a full repaint of just that region, since the
+   goal is removing the object entirely, not lightly retouching it.
+
+Plain `img2img` can't do this on its own: it just partially re-renders the
+*whole* image guided by the prompt text, so a command like "remove the
+cat" doesn't actually make the cat disappear — the model has no mechanism
+to understand "remove", it just restyles the picture, cat included.
+
+**It's optional, like the vision model.** Unlike every other model in
+this project, CLIPSeg isn't a GGUF file you download manually — it's
+pulled automatically from the Hugging Face Hub the first time a job needs
+it (`transformers`/`torch`, ~600MB) and cached locally afterward; this
+needs internet access on first use only. If it isn't installed or the
+download fails, the job simply errors out with a clear message (check
+`GET /health`'s `segmentation` field: `loaded`, `load_failed`,
+`load_error`) — other job modes are unaffected.
+
 ## systemd
 
 The unit loads the same `.env` file directly via `EnvironmentFile=`, so
@@ -248,6 +285,12 @@ For `img2img`/`inpaint`, additionally pass `init_image_b64` (and
 `mask_image_b64` for inpaint) — the source image, base64-encoded — and
 `strength` (0.0-1.0, how strongly to deviate from the source).
 
+For `img2img` specifically, an optional `remove_target` (a short English
+object name, e.g. `"cat"`) switches the job to automatic segmentation +
+inpainting instead of plain img2img — see "Removing a named object"
+above. When set, `strength`/`negative_prompt` are ignored (the worker
+sets its own for this path); `prompt` is only used for logging.
+
 For `mode="caption"` (image understanding — see "Understanding an
 uploaded image" above), `prompt` is the question and `init_image_b64` is
 the image; `width`/`height`/`steps`/`cfg_scale` are ignored but still
@@ -256,7 +299,7 @@ required by the request shape below (any value works, e.g. the defaults).
 **GET /jobs/{id}** — status without image content:
 
 ```json
-{"id": 7, "status": "done", "mode": "txt2img", "created_at": 1785e9, "started_at": ..., "finished_at": ..., "error_message": null, "result_text": null}
+{"id": 7, "status": "done", "mode": "txt2img", "prompt": "a cat wearing a hat", "created_at": 1785e9, "started_at": ..., "finished_at": ..., "error_message": null, "result_text": null}
 ```
 
 `status`: `queued` -> `processing` -> `done` | `error`. `result_text` is
@@ -277,7 +320,7 @@ finished.
 **GET /health** — diagnostics, no side effects:
 
 ```json
-{"status": "ok", "model_path": "...", "inpaint_model_path": "...", "vision": {"model_path": "...", "mmproj_path": "...", "files_found": true, "loaded": false, "load_failed": false, "load_error": null}}
+{"status": "ok", "model_path": "...", "inpaint_model_path": "...", "vision": {"model_path": "...", "mmproj_path": "...", "files_found": true, "loaded": false, "load_failed": false, "load_error": null}, "segmentation": {"model": "CIDAS/clipseg-rd64-refined", "loaded": false, "load_failed": false, "load_error": null}}
 ```
 
 ## Manual smoke test (curl)

@@ -18,7 +18,7 @@ import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from conf import config, models
+from conf import config, models, segmentation
 from db import db
 
 _JOB_RESULT_RE = re.compile(r"^/jobs/(\d+)/result$")
@@ -74,6 +74,7 @@ class Handler(BaseHTTPRequestHandler):
                 strength=data.get("strength"),
                 init_image=init_image,
                 mask_image=mask_image,
+                remove_target=data.get("remove_target"),
             )
             self._send_json(202, {"job_id": job_id, "status": "queued"})
         except Exception as e:
@@ -89,6 +90,7 @@ class Handler(BaseHTTPRequestHandler):
                     "model_path": config.MODEL_PATH,
                     "inpaint_model_path": config.INPAINT_MODEL_PATH,
                     "vision": models.vision_status(),
+                    "segmentation": segmentation.status(),
                 },
             )
             return

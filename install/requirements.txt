@@ -7,3 +7,12 @@ python-dotenv
 # image"). Safe to leave installed even if you never download the vision
 # model files; it's a normal pip dependency, not a heavy build step.
 llama-cpp-python
+
+# Optional: only needed for mode="img2img" jobs carrying remove_target
+# (automatic object segmentation before inpainting — see
+# conf/segmentation.py and README.md "Removing a named object"). Installs
+# a CPU build of PyTorch; on Linux, prefer the CPU-only wheel index to
+# avoid pulling in CUDA packages you don't need for this:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+transformers
+torch

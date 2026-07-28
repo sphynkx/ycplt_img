@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 
     init_image BLOB,
     mask_image BLOB,
+    remove_target TEXT,   -- mode="img2img" only: object name for auto-mask + inpaint removal
     result_image BLOB,
     result_text TEXT,     -- mode="caption" result (image jobs use result_image instead)
     error_message TEXT,
@@ -58,6 +59,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     table that already exists from an earlier version)."""
     if not _column_exists(conn, "jobs", "result_text"):
         conn.execute("ALTER TABLE jobs ADD COLUMN result_text TEXT")
+    if not _column_exists(conn, "jobs", "remove_target"):
+        conn.execute("ALTER TABLE jobs ADD COLUMN remove_target TEXT")
 
 
 def _connect() -> sqlite3.Connection:
@@ -98,16 +101,17 @@ def create_job(
     strength: Optional[float] = None,
     init_image: Optional[bytes] = None,
     mask_image: Optional[bytes] = None,
+    remove_target: Optional[str] = None,
 ) -> int:
     now = time.time()
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO jobs (status, mode, prompt, negative_prompt, width, height, steps, "
-            "cfg_scale, seed, strength, init_image, mask_image, created_at) "
-            "VALUES ('queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "cfg_scale, seed, strength, init_image, mask_image, remove_target, created_at) "
+            "VALUES ('queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 mode, prompt, negative_prompt, width, height, steps,
-                cfg_scale, seed, strength, init_image, mask_image, now,
+                cfg_scale, seed, strength, init_image, mask_image, remove_target, now,
             ),
         )
         return cur.lastrowid
@@ -119,10 +123,12 @@ def get_job_status(job_id: int) -> Optional[Dict[str, Any]]:
     only) so the client can read a text answer straight from the status
     response instead of needing a second round-trip the way image results
     (via GET /jobs/{id}/result) do — text is small enough that bundling it
-    here is simpler for both sides."""
+    here is simpler for both sides. Also includes prompt (the original
+    question, for caption jobs) so the client can use it for a follow-up
+    step (e.g. rephrasing/translating the answer) without a second lookup."""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id, status, mode, created_at, started_at, finished_at, "
+            "SELECT id, status, mode, prompt, created_at, started_at, finished_at, "
             "error_message, result_text FROM jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
