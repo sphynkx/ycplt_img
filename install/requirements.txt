@@ -1,3 +1,9 @@
 stable-diffusion-cpp-python
 Pillow
 python-dotenv
+
+# Optional: only needed for mode="caption" jobs (image understanding via
+# moondream2 — see conf/models.py and README.md "Understanding an uploaded
+# image"). Safe to leave installed even if you never download the vision
+# model files; it's a normal pip dependency, not a heavy build step.
+llama-cpp-python

@@ -8,15 +8,17 @@ HTTP handlers stay light and responsive even during a multi-hour generation.
 
 API:
   POST   /jobs              -> {job_id}                (create a job)
-  GET    /jobs/{id}         -> {id, status, ...}        (status, no image)
-  GET    /jobs/{id}/result  -> image/png                (finished result)
+  GET    /jobs/{id}         -> {id, status, ...}        (status, no image; result_text for mode="caption")
+  GET    /jobs/{id}/result  -> image/png                (finished image result)
   DELETE /jobs/{id}         -> {status: "ok"}           (client claimed the result)
+  GET    /health            -> {status, model, vision}  (diagnostics, no side effects)
 """
 import base64
 import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from conf import config, models
 from db import db
 
 _JOB_RESULT_RE = re.compile(r"^/jobs/(\d+)/result$")
@@ -77,8 +79,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(400, {"error": str(e)})
 
-    # ---------- GET /jobs/{id} and /jobs/{id}/result ----------
+    # ---------- GET /health, /jobs/{id} and /jobs/{id}/result ----------
     def do_GET(self):
+        if self.path == "/health":
+            self._send_json(
+                200,
+                {
+                    "status": "ok",
+                    "model_path": config.MODEL_PATH,
+                    "inpaint_model_path": config.INPAINT_MODEL_PATH,
+                    "vision": models.vision_status(),
+                },
+            )
+            return
+
         m = _JOB_RESULT_RE.match(self.path)
         if m:
             job_id = int(m.group(1))

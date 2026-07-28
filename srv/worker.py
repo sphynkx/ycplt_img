@@ -1,20 +1,22 @@
-"""Background worker: processes the queue strictly one job at a time, using
-the model that was already loaded once at daemon startup (see app.py — the
-model is passed in here, not reloaded between jobs).
+"""Background worker: processes the queue strictly one job at a time. Which
+model instance handles a given job is decided per-job by conf/models.py's
+factory (get_model_for_mode) rather than a single fixed instance — see that
+module for how modes map to checkpoints and why instances are cached rather
+than reloaded.
 
 Parallel job processing is intentionally not implemented: on a single
 CPU-bound machine it buys no throughput (jobs would just split the same
-cores), while doubling memory usage for the loaded model.
+cores), while doubling memory usage for whichever model(s) are loaded.
 """
 import io
 import time
 import traceback
 
-from conf import config
+from conf import config, models
 from db import db
 
 
-def run_worker(stable_diffusion) -> None:
+def run_worker() -> None:
     """Infinite queue-processing loop."""
     while True:
         job = db.fetch_next_queued()
@@ -23,11 +25,15 @@ def run_worker(stable_diffusion) -> None:
             continue
 
         db.mark_processing(job["id"])
-        print(f"[job {job['id']}] starting generation ({job['mode']}): {job['prompt'][:60]!r}")
+        print(f"[job {job['id']}] starting ({job['mode']}): {job['prompt'][:60]!r}")
 
         try:
-            image_bytes = _generate(stable_diffusion, job)
-            db.mark_done(job["id"], image_bytes)
+            if job["mode"] == "caption":
+                text = _caption(job)
+                db.mark_done_text(job["id"], text)
+            else:
+                image_bytes = _generate(job)
+                db.mark_done(job["id"], image_bytes)
             print(f"[job {job['id']}] done")
         except Exception as e:
             db.mark_error(job["id"], f"{e}\n{traceback.format_exc()}")
@@ -36,8 +42,49 @@ def run_worker(stable_diffusion) -> None:
         db.purge_expired(config.JOB_TTL_HOURS)
 
 
-def _generate(stable_diffusion, job) -> bytes:
+def _caption(job) -> str:
+    """mode="caption": answers a question about (or describes) job['init_image']
+    using the vision model (conf/models.get_vision_model()) instead of
+    generating pixels. job['prompt'] carries the user's question, reusing
+    the same column generation jobs use for their prompt — no schema
+    change needed beyond result_text (see db/db.py)."""
+    import base64
+
+    llm = models.get_vision_model()
+    if llm is None:
+        status = models.vision_status()
+        raise RuntimeError(
+            "vision model unavailable: "
+            + (status["load_error"] or "not configured — see conf/config.VISION_MODEL_PATH")
+        )
+    if not job["init_image"]:
+        raise RuntimeError("mode='caption' requires init_image")
+
+    # The data URI's declared mime type is effectively decorative here —
+    # the handler decodes the base64 bytes and detects the actual image
+    # format from its contents, not from this label — so a fixed "image/png"
+    # is fine regardless of what the original upload's real format was.
+    data_uri = "data:image/png;base64," + base64.b64encode(job["init_image"]).decode("ascii")
+    question = job["prompt"] or "Describe this image."
+
+    response = llm.create_chat_completion(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                    {"type": "text", "text": question},
+                ],
+            }
+        ],
+    )
+    return response["choices"][0]["message"]["content"]
+
+
+def _generate(job) -> bytes:
     from PIL import Image  # local import: only needed here
+
+    stable_diffusion = models.get_model_for_mode(job["mode"])
 
     kwargs = dict(
         prompt=job["prompt"],

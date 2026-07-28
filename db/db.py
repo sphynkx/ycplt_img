@@ -21,7 +21,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     status TEXT NOT NULL DEFAULT 'queued',      -- queued|processing|done|error
-    mode TEXT NOT NULL DEFAULT 'txt2img',        -- txt2img|img2img|inpaint
+    mode TEXT NOT NULL DEFAULT 'txt2img',        -- txt2img|img2img|inpaint|caption
 
     prompt TEXT NOT NULL,
     negative_prompt TEXT,
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     init_image BLOB,
     mask_image BLOB,
     result_image BLOB,
+    result_text TEXT,     -- mode="caption" result (image jobs use result_image instead)
     error_message TEXT,
 
     created_at REAL NOT NULL,
@@ -44,6 +45,19 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 """
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r["name"] == column for r in rows)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Adds columns introduced after the initial schema to an existing
+    jobs.sqlite3 (CREATE TABLE IF NOT EXISTS alone won't add a column to a
+    table that already exists from an earlier version)."""
+    if not _column_exists(conn, "jobs", "result_text"):
+        conn.execute("ALTER TABLE jobs ADD COLUMN result_text TEXT")
 
 
 def _connect() -> sqlite3.Connection:
@@ -68,6 +82,7 @@ def get_conn():
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 # ---------- Writing jobs ----------
@@ -100,10 +115,15 @@ def create_job(
 
 # ---------- Reading status/result (for the client) ----------
 def get_job_status(job_id: int) -> Optional[Dict[str, Any]]:
+    """Includes result_text (populated for finished mode="caption" jobs
+    only) so the client can read a text answer straight from the status
+    response instead of needing a second round-trip the way image results
+    (via GET /jobs/{id}/result) do — text is small enough that bundling it
+    here is simpler for both sides."""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id, status, mode, created_at, started_at, finished_at, error_message "
-            "FROM jobs WHERE id = ?",
+            "SELECT id, status, mode, created_at, started_at, finished_at, "
+            "error_message, result_text FROM jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
         return dict(row) if row else None
@@ -144,6 +164,16 @@ def mark_done(job_id: int, result_image: bytes) -> None:
         conn.execute(
             "UPDATE jobs SET status = 'done', result_image = ?, finished_at = ? WHERE id = ?",
             (result_image, time.time(), job_id),
+        )
+
+
+def mark_done_text(job_id: int, result_text: str) -> None:
+    """Same as mark_done() but for mode="caption" jobs, which produce a
+    text answer instead of an image."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = 'done', result_text = ?, finished_at = ? WHERE id = ?",
+            (result_text, time.time(), job_id),
         )
 
 

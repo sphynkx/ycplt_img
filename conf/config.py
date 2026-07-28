@@ -38,6 +38,49 @@ MODEL_PATH = _explicit_model_path if _explicit_model_path else os.path.join(MODE
 # stable_diffusion_cpp, e.g. "q4_0", "q8_0", "f16", "default").
 WTYPE = os.environ.get("YCPLT_WTYPE", "q4_0")
 
+# Optional dedicated checkpoint for masked inpainting jobs (mode="inpaint"
+# with a mask_image) — see conf/models.py. If INPAINT_MODEL is left unset,
+# inpaint jobs fall back to the same MODEL_PATH/WTYPE as everything else;
+# they'll still run, just with the "poor results without a model fine-tuned
+# for inpainting" caveat stable-diffusion-cpp-python's own docs mention.
+INPAINT_MODEL = os.environ.get("INPAINT_MODEL", "")
+_explicit_inpaint_model_path = os.environ.get("YCPLT_INPAINT_MODEL_PATH", "")
+if _explicit_inpaint_model_path:
+    INPAINT_MODEL_PATH = _explicit_inpaint_model_path
+elif INPAINT_MODEL:
+    INPAINT_MODEL_PATH = os.path.join(MODELS_DIR, INPAINT_MODEL)
+else:
+    INPAINT_MODEL_PATH = MODEL_PATH  # no dedicated inpainting checkpoint configured
+
+INPAINT_WTYPE = os.environ.get("YCPLT_INPAINT_WTYPE", WTYPE)
+
+# Optional vision/captioning model (moondream2, loaded via llama-cpp-python
+# rather than stable-diffusion-cpp — a different backend entirely) for
+# mode="caption" jobs: answering "what's in this image?" instead of
+# generating/editing pixels. This is the graphics service, so this model
+# lives here rather than in the main chat app — see conf/models.py and
+# README.md "Understanding an uploaded image". Off by default: if these
+# files aren't present, caption jobs simply fail with a clear error
+# (conf/models.get_vision_model() returns None, see srv/worker.py),
+# generation/editing jobs are unaffected either way.
+VISION_MODEL = os.environ.get("VISION_MODEL", "moondream2-text-model-f16_ct-vicuna.gguf")
+_explicit_vision_model_path = os.environ.get("YCPLT_VISION_MODEL_PATH", "")
+VISION_MODEL_PATH = (
+    _explicit_vision_model_path
+    if _explicit_vision_model_path
+    else os.path.join(MODELS_DIR, VISION_MODEL)
+)
+
+VISION_MMPROJ = os.environ.get("VISION_MMPROJ", "moondream2-mmproj-f16-20250414.gguf")
+_explicit_vision_mmproj_path = os.environ.get("YCPLT_VISION_MMPROJ_PATH", "")
+VISION_MMPROJ_PATH = (
+    _explicit_vision_mmproj_path
+    if _explicit_vision_mmproj_path
+    else os.path.join(MODELS_DIR, VISION_MMPROJ)
+)
+
+VISION_N_CTX = int(os.environ.get("YCPLT_VISION_N_CTX", "2048"))
+
 # Job queue
 DB_PATH = os.environ.get("YCPLT_DB_PATH", "data/jobs.sqlite3")
 
