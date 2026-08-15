@@ -75,6 +75,7 @@ class Handler(BaseHTTPRequestHandler):
                 init_image=init_image,
                 mask_image=mask_image,
                 remove_target=data.get("remove_target"),
+                reconstruct_prompt=data.get("reconstruct_prompt"),
             )
             self._send_json(202, {"job_id": job_id, "status": "queued"})
         except Exception as e:
@@ -83,14 +84,24 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- GET /health, /jobs/{id} and /jobs/{id}/result ----------
     def do_GET(self):
         if self.path == "/health":
+            # wtype/inpaint_wtype and whether INPAINT_MODEL_PATH actually
+            # differs from MODEL_PATH are surfaced explicitly here — the
+            # kind of silent misconfiguration that's easy to miss otherwise
+            # (INPAINT_MODEL left unset means every "remove X"/masked-edit
+            # job quietly uses the base checkpoint instead of one fine-tuned
+            # for inpainting, with no error, just a much worse result).
             self._send_json(
                 200,
                 {
                     "status": "ok",
                     "model_path": config.MODEL_PATH,
+                    "wtype": config.WTYPE,
                     "inpaint_model_path": config.INPAINT_MODEL_PATH,
+                    "inpaint_wtype": config.INPAINT_WTYPE,
+                    "inpaint_model_configured": config.INPAINT_MODEL_PATH != config.MODEL_PATH,
                     "vision": models.vision_status(),
                     "segmentation": segmentation.status(),
+                    "lama": models.lama_status(),
                 },
             )
             return

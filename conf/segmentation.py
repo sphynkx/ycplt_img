@@ -62,7 +62,7 @@ def _get_model():
     return _processor, _model
 
 
-def get_mask(image, object_name: str, threshold: float = 0.35):
+def get_mask(image, object_name: str, threshold: float = 0.35, dilate_px: Optional[int] = None):
     """Returns a grayscale PIL Image mask for object_name in image (255 =
     edit this area, 0 = keep — the same convention as a manually-drawn
     inpainting mask), or None if CLIPSeg isn't available.
@@ -70,6 +70,21 @@ def get_mask(image, object_name: str, threshold: float = 0.35):
     threshold is applied to CLIPSeg's per-pixel sigmoid confidence map;
     0.35 is a middle-ground default — lower catches more of the object's
     edges/shadow at the risk of over-masking, higher is more conservative.
+
+    dilate_px (defaults to config.REMOVE_MASK_DILATE_PX) grows the mask
+    outward by roughly this many pixels after thresholding — a real,
+    reported failure mode without it: CLIPSeg's confidence reliably drops
+    off at soft/fuzzy edges (fur, whiskers, hair, blurred motion), so the
+    raw thresholded mask tends to undershoot the object's true silhouette
+    and leave a thin sliver of it (an ear, a paw, a few whiskers) still
+    visible just outside the masked region. That sliver is enough to bias
+    an inpainting model toward completing/extending the same KIND of
+    object rather than inventing plain background — the model still sees
+    "there's a partial cat here" and finishes the picture accordingly
+    (observed directly: a "remove the cat" job produced a DIFFERENT cat in
+    the same spot, not an empty background, on an otherwise correctly
+    configured inpainting checkpoint). Growing the mask past those visible
+    remnants removes that cue entirely.
     """
     processor, model = _get_model()
     if processor is None:
@@ -77,7 +92,7 @@ def get_mask(image, object_name: str, threshold: float = 0.35):
 
     import numpy as np
     import torch
-    from PIL import Image
+    from PIL import Image, ImageFilter
 
     inputs = processor(text=[object_name], images=[image], padding=True, return_tensors="pt")
     with torch.no_grad():
@@ -88,4 +103,14 @@ def get_mask(image, object_name: str, threshold: float = 0.35):
     probs = torch.sigmoid(outputs.logits.squeeze(0)).numpy()
     binary = (probs > threshold).astype(np.uint8) * 255
     mask = Image.fromarray(binary, mode="L").resize(image.size)
+
+    px = config.REMOVE_MASK_DILATE_PX if dilate_px is None else dilate_px
+    if px > 0:
+        # PIL's MaxFilter grows the white (255, "edit this area") region by
+        # roughly kernel_size // 2 pixels per application — a plain
+        # morphological dilation, applied here after the resize above so
+        # the requested pixel count means the same thing regardless of
+        # CLIPSeg's own (much lower) internal heatmap resolution. Kernel
+        # size must be odd.
+        mask = mask.filter(ImageFilter.MaxFilter(px * 2 + 1))
     return mask

@@ -16,3 +16,11 @@ llama-cpp-python
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
 transformers
 torch
+
+# (The actual object-removal repaint step — LaMa — is also part of
+# remove_target jobs, but needs no separate package here: it's vendored
+# in conf/lama_model.py using the torch/numpy/Pillow already listed above,
+# rather than the `simple-lama-inpainting` PyPI package, which pins an
+# old pillow/numpy range with no prebuilt wheels for current Python
+# versions — see that file's docstring for the full explanation. Nothing
+# extra to install for this beyond what's already above.)

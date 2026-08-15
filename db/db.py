@@ -34,7 +34,10 @@ CREATE TABLE IF NOT EXISTS jobs (
 
     init_image BLOB,
     mask_image BLOB,
-    remove_target TEXT,   -- mode="img2img" only: object name for auto-mask + inpaint removal
+    remove_target TEXT,       -- mode="img2img" only: object name for auto-mask + inpaint removal
+    reconstruct_prompt TEXT,  -- mode="img2img" + remove_target only: optional description of
+                              -- what to draw in the removed object's place (see srv/worker.py's
+                              -- _generate_removal_edit) instead of plain background
     result_image BLOB,
     result_text TEXT,     -- mode="caption" result (image jobs use result_image instead)
     error_message TEXT,
@@ -61,6 +64,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE jobs ADD COLUMN result_text TEXT")
     if not _column_exists(conn, "jobs", "remove_target"):
         conn.execute("ALTER TABLE jobs ADD COLUMN remove_target TEXT")
+    if not _column_exists(conn, "jobs", "reconstruct_prompt"):
+        conn.execute("ALTER TABLE jobs ADD COLUMN reconstruct_prompt TEXT")
 
 
 def _connect() -> sqlite3.Connection:
@@ -102,16 +107,19 @@ def create_job(
     init_image: Optional[bytes] = None,
     mask_image: Optional[bytes] = None,
     remove_target: Optional[str] = None,
+    reconstruct_prompt: Optional[str] = None,
 ) -> int:
     now = time.time()
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO jobs (status, mode, prompt, negative_prompt, width, height, steps, "
-            "cfg_scale, seed, strength, init_image, mask_image, remove_target, created_at) "
-            "VALUES ('queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "cfg_scale, seed, strength, init_image, mask_image, remove_target, "
+            "reconstruct_prompt, created_at) "
+            "VALUES ('queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 mode, prompt, negative_prompt, width, height, steps,
-                cfg_scale, seed, strength, init_image, mask_image, remove_target, now,
+                cfg_scale, seed, strength, init_image, mask_image, remove_target,
+                reconstruct_prompt, now,
             ),
         )
         return cur.lastrowid
