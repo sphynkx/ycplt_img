@@ -234,3 +234,75 @@ def get_lama_model():
         _lama_load_failed = True
         return None
     return _lama
+
+
+# ---------- FLUX.1 Kontext (experimental, general instruction-based editing) ----------
+# See conf/config.py's KONTEXT_* settings and README.md "Instruction-based
+# editing (FLUX.1 Kontext, experimental)" for the full rationale. Unlike
+# every StableDiffusion checkpoint above (a single model_path file),
+# Kontext loads from four separate files — diffusion_model_path (the
+# quantized GGUF transformer itself), clip_l_path/t5xxl_path (Flux's two
+# text encoders), and vae_path — so this gets its own loader rather than
+# reusing _load()/get_model_for_mode()'s single-file assumption.
+_kontext = None
+_kontext_load_failed = False
+_kontext_load_error = None
+
+
+def kontext_status() -> dict:
+    """Diagnostic snapshot for GET /health — never raises."""
+    return {
+        "enabled": config.KONTEXT_ENABLED,
+        "loaded": _kontext is not None,
+        "load_failed": _kontext_load_failed,
+        "load_error": _kontext_load_error,
+    }
+
+
+def get_kontext_model():
+    """Lazily loads and caches the FLUX.1 Kontext model. Returns None
+    (never raises) if config.KONTEXT_ENABLED is off, any of the four
+    required files are missing, or loading fails — callers (srv/worker.py)
+    turn that into a normal job error rather than crashing the worker,
+    the same fail-safe pattern as get_lama_model()/get_vision_model()
+    above."""
+    global _kontext, _kontext_load_failed, _kontext_load_error
+    if _kontext is not None:
+        return _kontext
+    if _kontext_load_failed:
+        return None
+    if not config.KONTEXT_ENABLED:
+        return None
+
+    import os
+
+    required = {
+        "diffusion model": config.KONTEXT_DIFFUSION_MODEL_PATH,
+        "clip_l": config.KONTEXT_CLIP_L_PATH,
+        "t5xxl": config.KONTEXT_T5XXL_PATH,
+        "vae": config.KONTEXT_VAE_PATH,
+    }
+    missing = [f"{label} ({path})" for label, path in required.items() if not os.path.exists(path)]
+    if missing:
+        _kontext_load_failed = True
+        _kontext_load_error = "model files not found: " + "; ".join(missing)
+        return None
+
+    try:
+        from stable_diffusion_cpp import StableDiffusion
+
+        print(f"[models] loading FLUX.1 Kontext ({config.KONTEXT_DIFFUSION_MODEL_PATH}) "
+              "— this is a large model, expect a slow first load and slow generation...")
+        _kontext = StableDiffusion(
+            diffusion_model_path=config.KONTEXT_DIFFUSION_MODEL_PATH,
+            clip_l_path=config.KONTEXT_CLIP_L_PATH,
+            t5xxl_path=config.KONTEXT_T5XXL_PATH,
+            vae_path=config.KONTEXT_VAE_PATH,
+        )
+        print("[models] FLUX.1 Kontext loaded, staying resident in memory.")
+    except Exception as e:
+        print(f"[models] FLUX.1 Kontext failed to load: {e}")
+        _kontext_load_error = str(e)
+        _kontext_load_failed = True
+        return None
+    return _kontext

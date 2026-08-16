@@ -508,6 +508,163 @@ and `INPAINT_MODEL` remain fully in use for genuine prompt-guided masked
 edits (a job with an explicit mask AND a real edit instruction, not just
 "remove this") — see "Editing and inpainting models" above.
 
+## Instruction-based editing (FLUX.1 Kontext, experimental)
+
+Every model above (`MODEL`/`INPAINT_MODEL`, LaMa) has a narrow, fixed job.
+Plain `img2img` — the fallback for any edit instruction that *isn't* a
+`remove_target` — has no real way to follow an arbitrary described
+transformation: it's just a low-strength denoise starting from the
+uploaded image, guided by a text prompt describing the *destination*
+picture, not an instruction to *apply*. Real, reported failure: a test
+request "redraw this photo of a woman as if she were a man" came back
+through plain `img2img` essentially unchanged — there's no mechanism to
+express "keep the composition, change this one attribute" the way a real
+instruction-following edit model does.
+
+[FLUX.1 Kontext [dev]](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev)
+(Black Forest Labs, a 12B-parameter rectified flow transformer) is trained
+specifically for this: given a source image and a text instruction, it
+edits the image accordingly — not a masked region, not a strength-blended
+repaint. **This is EXPERIMENTAL and off by default** (`YCPLT_KONTEXT_ENABLED=false`):
+it's a much heavier model than anything else this project loads (12B vs
+SD1.x's ~1B parameters) and has not yet been tested end-to-end against
+real hardware from this codebase's own development environment. It ships
+in its own separate branch/config gate specifically so it can be deleted
+without touching anything else if it doesn't pan out.
+
+**Zero main-app changes needed.** Unlike `reconstruct_prompt` above (which
+needed a new two-stage LLM classifier on the main app side to detect
+intent), the decision to route a job through Kontext is made entirely
+inside this service's own worker dispatch
+(`job["mode"] == "img2img" and job["init_image"] and models.get_kontext_model() is not None`,
+see `srv/worker.py`). A plain `img2img` job already carries everything
+Kontext needs — `prompt` (the edit instruction) and `init_image` (the
+source photo) — so once configured and enabled, Kontext transparently
+takes over every non-removal edit job; with it left disabled or
+misconfigured, every edit job falls straight through to the unchanged
+plain `img2img` path exactly as before.
+
+### Setup
+
+Unlike `MODEL`/`INPAINT_MODEL` (one checkpoint file), Kontext loads from
+**four separate files** — none of them bundled together, all need
+downloading individually:
+
+1. **Diffusion transformer** (the model itself, GGUF-quantized). Recommended:
+   **Q4_K_M, ~6.9GB** — a reasonable quality/size balance among the
+   available K-quants (`Q2_K` 4.0GB up through `Q8_0` 12.7GB, full
+   precision 23.8GB) from
+   [unsloth/FLUX.1-Kontext-dev-GGUF](https://huggingface.co/unsloth/FLUX.1-Kontext-dev-GGUF):
+
+   ```bash
+   wget -O models/flux1-kontext-dev-Q4_K_M.gguf \
+     "https://huggingface.co/unsloth/FLUX.1-Kontext-dev-GGUF/resolve/main/flux1-kontext-dev-Q4_K_M.gguf"
+   ```
+
+2. **clip_l** text encoder (~246MB):
+
+   ```bash
+   wget -O models/clip_l.safetensors \
+     "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors"
+   ```
+
+3. **t5xxl** text encoder — fp8 (~4.9GB) recommended over the full fp16
+   (~9.5GB) as the common size/quality tradeoff in the Flux/ComfyUI
+   community:
+
+   ```bash
+   wget -O models/t5xxl_fp8_e4m3fn.safetensors \
+     "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors"
+   ```
+
+4. **Flux's own VAE** (`ae.safetensors`, ~168MB). This one is **gated** on
+   Black Forest Labs' own repo — accept the FLUX.1-dev non-commercial
+   license at
+   [black-forest-labs/FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev)
+   and authenticate with a Hugging Face access token first
+   (`huggingface-cli login`, or pass `--header "Authorization: Bearer <token>"`
+   to `wget`); some ungated community mirrors also host a copy of the same
+   file if the gate is inconvenient — verify the file's checksum against
+   the official repo either way before trusting a mirror.
+
+Then enable it and point `KONTEXT_*` at the four files above (see
+`install/.env.example` for the full commented block, following the same
+`MODELS_DIR`-relative-filename + `YCPLT_KONTEXT_*_PATH`-explicit-override
+convention as `VISION_MODEL`/`VISION_MMPROJ`):
+
+```bash
+YCPLT_KONTEXT_ENABLED=true
+KONTEXT_DIFFUSION_MODEL=flux1-kontext-dev-Q4_K_M.gguf
+KONTEXT_CLIP_L=clip_l.safetensors
+KONTEXT_T5XXL=t5xxl_fp8_e4m3fn.safetensors
+KONTEXT_VAE=ae.safetensors
+```
+
+`GET /health`'s `kontext` field reports whether it's enabled, loaded, and
+(if loading failed) why — the same diagnostic pattern as `vision`/`lama`.
+
+### Tuning
+
+- `YCPLT_KONTEXT_GUIDANCE` (default `2.5`) — Flux is guidance-*distilled*
+  rather than classifier-free-guided the way SD1.x's `cfg_scale` works;
+  this is a genuinely separate parameter (`YCPLT_KONTEXT_CFG_SCALE`,
+  default `1.0`, is left near its floor since Flux barely uses it). `2.5`
+  matches Black Forest Labs' own reference usage example.
+- `YCPLT_KONTEXT_MAX_DIMENSION` (default `1024`, vs `512` for the SD1.x
+  models above) — the same proactive resolution cap as
+  `RECONSTRUCT_MAX_DIMENSION`, applied here from the start rather than
+  waiting to rediscover the exact out-of-memory crash that feature's own
+  history already went through, since a 12B-parameter diffusion
+  transformer's memory scaling is at least as steep as SD1.x's UNet.
+  `1024` is higher than the SD1.x default since Flux's native training
+  resolution is higher; lower it if the deployment machine doesn't have
+  RAM to spare.
+- `YCPLT_KONTEXT_MIN_DIMENSION` (default `768`) — the OTHER direction of
+  the same problem, found via real testing: a small 256x198 source photo
+  produced an edit that came back **identical to the input**, regardless
+  of prompt or quant. Confirmed to genuinely be a resolution problem (not
+  a prompt/parameter bug) by re-testing the exact same setup against a
+  2048x1536 source instead — which `KONTEXT_MAX_DIMENSION` alone
+  naturally scales down to Kontext's own ~1-megapixel training
+  resolution — and getting a correct, real edit. FLUX/Kontext is a
+  patch-based diffusion transformer trained at roughly 1024x1024-class
+  resolutions; fed a much smaller image, the latent grid is too small for
+  it to encode any meaningful edit, so it collapses toward reproducing
+  the (strongly-conditioning) reference almost unchanged. This setting
+  scales a source photo smaller than it back UP (never past
+  `KONTEXT_MAX_DIMENSION`) before generation, then resizes the result back
+  down to the original upload size afterward — same as the max-dimension
+  cap already does for oversized photos, just in the other direction.
+
+  **Real cost, confirmed on this project's own CPU-only test hardware:**
+  generating at ~256x192 took ~570s for 20 sampling steps; generating at
+  ~1024x768 (what a small photo gets pushed up to if
+  `KONTEXT_MIN_DIMENSION` were raised to `1024`) took **~11300s (~3.1
+  hours)** for the same 20 steps — compute scales far worse than linearly
+  with resolution for a full-attention diffusion transformer. `768` here
+  is a deliberate middle ground between "Kontext can't do anything useful
+  with the image" (too small) and "one edit takes half a day" (full
+  1024), not the best-quality choice — raise it toward `1024` only with
+  both the hardware and the patience for multi-hour edits, or lower it if
+  even `768` is too slow (accepting some risk of the same near-unchanged-
+  output failure mode on very small source photos).
+
+- **Prompt language: use English.** Real, reported failure: a Russian
+  edit instruction produced the same "identical to input" symptom as the
+  too-small-resolution case above, for a different reason — logging the
+  actual tokenization showed FLUX Kontext's text encoders (CLIP's BPE
+  vocabulary and T5's tokenizer) badly fragment or outright fail to
+  represent Cyrillic text (T5's tokenizer fell back to mostly `?`/unknown
+  tokens), leaving the model with no real instruction signal to condition
+  on — re-testing the identical setup with a clean English prompt
+  ("Redraw this photo of a woman as if she were a man.") produced clean,
+  correct tokenization. Kontext (like the base Flux/CLIP/T5 stack it's
+  built on) is trained overwhelmingly on English text; this service
+  itself does no translation (see main app's README for the
+  auto-translation step added on that side specifically for this), so any
+  caller submitting jobs directly to this API should send an English
+  `prompt` for `mode="img2img"` edits without `remove_target`.
+
 ## systemd
 
 The unit loads the same `.env` file directly via `EnvironmentFile=`, so
@@ -592,7 +749,7 @@ finished.
 **GET /health** — diagnostics, no side effects:
 
 ```json
-{"status": "ok", "model_path": "...", "wtype": "f16", "inpaint_model_path": "...", "inpaint_wtype": "f16", "inpaint_model_configured": true, "vision": {"model_path": "...", "mmproj_path": "...", "files_found": true, "loaded": false, "load_failed": false, "load_error": null}, "segmentation": {"model": "CIDAS/clipseg-rd64-refined", "loaded": false, "load_failed": false, "load_error": null}}
+{"status": "ok", "model_path": "...", "wtype": "f16", "inpaint_model_path": "...", "inpaint_wtype": "f16", "inpaint_model_configured": true, "vision": {"model_path": "...", "mmproj_path": "...", "files_found": true, "loaded": false, "load_failed": false, "load_error": null}, "segmentation": {"model": "CIDAS/clipseg-rd64-refined", "loaded": false, "load_failed": false, "load_error": null}, "lama": {"loaded": false, "load_failed": false, "load_error": null}, "kontext": {"enabled": false, "loaded": false, "load_failed": false, "load_error": null}}
 ```
 
 `inpaint_model_configured` is `false` when `INPAINT_MODEL` was never set

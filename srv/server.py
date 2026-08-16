@@ -11,7 +11,7 @@ API:
   GET    /jobs/{id}         -> {id, status, ...}        (status, no image; result_text for mode="caption")
   GET    /jobs/{id}/result  -> image/png                (finished image result)
   DELETE /jobs/{id}         -> {status: "ok"}           (client claimed the result)
-  GET    /health            -> {status, model, vision}  (diagnostics, no side effects)
+  GET    /health            -> {status, model, vision, lama, kontext}  (diagnostics, no side effects)
 """
 import base64
 import json
@@ -102,6 +102,7 @@ class Handler(BaseHTTPRequestHandler):
                     "vision": models.vision_status(),
                     "segmentation": segmentation.status(),
                     "lama": models.lama_status(),
+                    "kontext": models.kontext_status(),
                 },
             )
             return

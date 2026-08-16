@@ -230,6 +230,120 @@ RECONSTRUCT_ENABLED = os.environ.get("YCPLT_RECONSTRUCT_ENABLED", "false").strip
 # are worth the extra cost.
 RECONSTRUCT_MAX_DIMENSION = int(os.environ.get("YCPLT_RECONSTRUCT_MAX_DIMENSION", "512"))
 
+# ---------- FLUX.1 Kontext (experimental, general instruction-based editing) ----------
+#
+# Every model above (MODEL/INPAINT_MODEL, LaMa) has a narrow, fixed job —
+# they're fast and reliable at exactly that job, but plain img2img (the
+# fallback for any edit instruction that ISN'T a remove_target) has no
+# real way to follow an arbitrary described transformation: it's just a
+# low-strength denoise starting from the uploaded image, guided by a text
+# prompt describing the DESTINATION picture, not an instruction to APPLY.
+# Real, reported failure: "redraw this photo as if she were a man" came
+# back essentially unchanged — img2img has no mechanism to express "keep
+# the composition, change this one attribute" the way a real instruction-
+# following edit model does.
+#
+# FLUX.1 Kontext [dev] (Black Forest Labs, 12B-parameter rectified flow
+# transformer) is trained specifically for this: given a source image and
+# a text instruction, it edits the image accordingly, not a masked region
+# or a strength-blended repaint — see
+# https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev. This is
+# EXPERIMENTAL and off by default: it's a much heavier model (12B vs
+# SD1.x's ~1B) with a real memory/time cost (see KONTEXT_MAX_DIMENSION
+# below), and hasn't been tested end-to-end against real hardware from
+# this codebase's own development environment — see README.md
+# "Instruction-based editing (FLUX.1 Kontext, experimental)" for the
+# current status and setup instructions.
+KONTEXT_ENABLED = os.environ.get("YCPLT_KONTEXT_ENABLED", "false").strip().lower() not in (
+    "false", "0", "no", "off",
+)
+
+# Kontext has no single "full model" file the way MODEL/INPAINT_MODEL do —
+# stable-diffusion.cpp loads it from four separate files: the diffusion
+# transformer itself (a GGUF quantization — a full-precision safetensors
+# checkpoint is ~24GB; Q4_K_M is a reasonable quality/size balance at
+# ~6.9GB, see https://huggingface.co/unsloth/FLUX.1-Kontext-dev-GGUF),
+# the clip-l and t5xxl text encoders (Flux uses both, unlike SD1.x's
+# single CLIP), and Flux's own VAE. Same MODELS_DIR/explicit-full-path-
+# override convention as VISION_MODEL/VISION_MMPROJ above.
+KONTEXT_DIFFUSION_MODEL = os.environ.get("KONTEXT_DIFFUSION_MODEL", "flux1-kontext-dev-Q4_K_M.gguf")
+_explicit_kontext_diffusion_model_path = os.environ.get("YCPLT_KONTEXT_DIFFUSION_MODEL_PATH", "")
+KONTEXT_DIFFUSION_MODEL_PATH = (
+    _explicit_kontext_diffusion_model_path
+    if _explicit_kontext_diffusion_model_path
+    else os.path.join(MODELS_DIR, KONTEXT_DIFFUSION_MODEL)
+)
+
+KONTEXT_CLIP_L = os.environ.get("KONTEXT_CLIP_L", "clip_l.safetensors")
+_explicit_kontext_clip_l_path = os.environ.get("YCPLT_KONTEXT_CLIP_L_PATH", "")
+KONTEXT_CLIP_L_PATH = (
+    _explicit_kontext_clip_l_path if _explicit_kontext_clip_l_path else os.path.join(MODELS_DIR, KONTEXT_CLIP_L)
+)
+
+# fp8 rather than the full fp16 t5xxl (~9.5GB): a meaningful size saving
+# (~4.9GB) for a text encoder that's already distilled/guided rather than
+# doing the heavy lifting the diffusion transformer itself does — the
+# common choice in the Flux/ComfyUI community for exactly this tradeoff.
+KONTEXT_T5XXL = os.environ.get("KONTEXT_T5XXL", "t5xxl_fp8_e4m3fn.safetensors")
+_explicit_kontext_t5xxl_path = os.environ.get("YCPLT_KONTEXT_T5XXL_PATH", "")
+KONTEXT_T5XXL_PATH = (
+    _explicit_kontext_t5xxl_path if _explicit_kontext_t5xxl_path else os.path.join(MODELS_DIR, KONTEXT_T5XXL)
+)
+
+KONTEXT_VAE = os.environ.get("KONTEXT_VAE", "ae.safetensors")
+_explicit_kontext_vae_path = os.environ.get("YCPLT_KONTEXT_VAE_PATH", "")
+KONTEXT_VAE_PATH = (
+    _explicit_kontext_vae_path if _explicit_kontext_vae_path else os.path.join(MODELS_DIR, KONTEXT_VAE)
+)
+
+# Flux is guidance-DISTILLED rather than classifier-free-guided the way
+# SD1.x's cfg_scale works — stable-diffusion-cpp-python exposes this as a
+# separate `guidance` parameter (distinct from `cfg_scale`, which Flux
+# barely uses; left near 1.0). 2.5 matches the value used in Black Forest
+# Labs' own reference usage example on the model card.
+KONTEXT_GUIDANCE = float(os.environ.get("YCPLT_KONTEXT_GUIDANCE", "2.5"))
+KONTEXT_CFG_SCALE = float(os.environ.get("YCPLT_KONTEXT_CFG_SCALE", "1.0"))
+
+# Same rationale as RECONSTRUCT_MAX_DIMENSION above (real OOM crash risk
+# from generating at an uncapped, potentially huge upload resolution) —
+# applied proactively here rather than waiting to rediscover the same
+# mistake, since a 12B diffusion transformer's memory scaling is at least
+# as steep as SD1.x's UNet. 1024 (vs 512 for the SD1.x-family models
+# above) since Flux's native training resolution is higher; lower this if
+# the deployment machine doesn't have RAM to spare.
+KONTEXT_MAX_DIMENSION = int(os.environ.get("YCPLT_KONTEXT_MAX_DIMENSION", "1024"))
+
+# Lower bound (px, longer side) — the OTHER direction of the same problem
+# KONTEXT_MAX_DIMENSION solves, discovered via real, reported testing: a
+# small 256x198 source photo produced a Kontext "edit" that came back
+# identical to the input, regardless of prompt language/content or which
+# diffusion GGUF quant was loaded. Confirmed to genuinely be a resolution
+# problem (not a prompt/parameter bug) by re-testing the exact same setup
+# against a 2048x1536 source instead — which KONTEXT_MAX_DIMENSION alone
+# naturally scales down to Kontext's own ~1-megapixel training
+# resolution — and getting a real, correct edit. FLUX/Kontext is a
+# patch-based diffusion transformer trained at roughly 1024x1024-class
+# resolutions; fed a much smaller image, the latent grid is too small for
+# it to encode any meaningful edit, so it collapses toward reproducing
+# the (strongly-conditioning) reference almost unchanged. srv/worker.py's
+# _fit_gen_size scales a source photo smaller than this back UP (never
+# past KONTEXT_MAX_DIMENSION) before generation, then resizes the result
+# back down to the original upload size afterward, same as it already
+# does for oversized photos.
+#
+# REAL COST, confirmed on this project's own CPU-only test hardware:
+# generating at ~256x192 took ~570s; generating at ~1024x768 (the
+# resolution this setting pushes small photos up to) took ~11300s
+# (~3.1 HOURS) for the same 20 sampling steps — compute scales far worse
+# than linearly with resolution for a full-attention diffusion
+# transformer. 768 here (rather than defaulting to the full 1024 of
+# KONTEXT_MAX_DIMENSION) is a deliberate middle ground, not the
+# best-quality choice — raise it toward 1024 only if the hardware and
+# patience for multi-hour edits are both available; lower it (accepting
+# a worse edit-quality risk on small photos, per the failure mode above)
+# if even that is too slow.
+KONTEXT_MIN_DIMENSION = int(os.environ.get("YCPLT_KONTEXT_MIN_DIMENSION", "768"))
+
 # Job queue
 DB_PATH = os.environ.get("YCPLT_DB_PATH", "data/jobs.sqlite3")
 

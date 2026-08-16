@@ -34,6 +34,18 @@ def run_worker() -> None:
             elif job["mode"] == "img2img" and job.get("remove_target"):
                 image_bytes = _generate_removal_edit(job)
                 db.mark_done(job["id"], image_bytes)
+            elif job["mode"] == "img2img" and job["init_image"] and models.get_kontext_model() is not None:
+                # Experimental: once FLUX.1 Kontext is configured and
+                # enabled (config.KONTEXT_ENABLED, conf/models.py's
+                # get_kontext_model()), it takes over every general edit
+                # instruction (anything that isn't a remove_target job) —
+                # no main-app changes needed, since the prompt/init_image
+                # a plain img2img job already carries is exactly what
+                # Kontext needs too. See _generate_kontext_edit's own
+                # docstring for why this exists (plain img2img has no way
+                # to follow an arbitrary described transformation).
+                image_bytes = _generate_kontext_edit(job)
+                db.mark_done(job["id"], image_bytes)
             else:
                 image_bytes = _generate(job)
                 db.mark_done(job["id"], image_bytes)
@@ -84,7 +96,9 @@ def _caption(job) -> str:
     return response["choices"][0]["message"]["content"]
 
 
-def _fit_gen_size(width: int, height: int, max_dimension: int, multiple: int = 64) -> tuple:
+def _fit_gen_size(
+    width: int, height: int, max_dimension: int, multiple: int = 64, min_dimension: int = None
+) -> tuple:
     """Picks the (width, height) to actually generate at for a masked
     reconstruct_prompt edit — aligned with init_image/mask (the fix for
     the striped/scrambled-output corruption bug), but capped at
@@ -94,15 +108,47 @@ def _fit_gen_size(width: int, height: int, max_dimension: int, multiple: int = 6
     worker process outright — see config.RECONSTRUCT_MAX_DIMENSION's own
     comment for the full story).
 
-    Scales (width, height) down — never up — to fit within max_dimension,
-    preserving aspect ratio, then rounds to the nearest multiple of
-    `multiple` (SD1.x needs at least a multiple of 8; 64 matches this
-    project's existing 512x512-style defaults). The final rounding step
-    is nudged down by one multiple if it would otherwise land just over
-    max_dimension, so the cap is a real, honored ceiling rather than a
-    rough target.
+    Scales (width, height) down to fit within max_dimension, preserving
+    aspect ratio, then rounds to the nearest multiple of `multiple` (SD1.x
+    needs at least a multiple of 8; 64 matches this project's existing
+    512x512-style defaults). The final rounding step is nudged down by one
+    multiple if it would otherwise land just over max_dimension, so the
+    cap is a real, honored ceiling rather than a rough target.
+
+    `min_dimension` (optional, default None — every existing caller keeps
+    its old "never scale up" behavior unless it opts in): if given, and
+    the LONGER side after the max_dimension step above is still smaller
+    than this, scales back UP (never past max_dimension) to reach it
+    instead. Added specifically for FLUX.1 Kontext (see
+    _generate_kontext_edit and config.KONTEXT_MIN_DIMENSION's own
+    comment) after real, reported testing: a small 256x198 source photo —
+    which this function, before min_dimension existed, would pass through
+    completely untouched, since it's already well under
+    KONTEXT_MAX_DIMENSION — produced a Kontext edit that came back
+    identical to the input, regardless of prompt language/content or
+    quantization level. Root cause, confirmed by directly comparing
+    against a 2048x1536 source (which the max_dimension step alone
+    naturally scaled down to Kontext's own ~1-megapixel training
+    resolution, and which DID produce a real, correct edit): FLUX/Kontext
+    is a patch-based diffusion transformer trained at roughly 1024x1024-
+    class resolutions — fed a 256x198 image, the latent grid is over 20x
+    smaller than what it was trained on, too little spatial/token budget
+    for the transformer to encode a meaningful edit at all, so it
+    collapses toward reproducing the (strongly-conditioning) reference
+    almost unchanged. Reconstruct_prompt (SD1.x-family) has never shown
+    this specific failure mode in testing here, which is why this stays
+    an opt-in parameter rather than changed default behavior for every
+    caller.
     """
-    scale = min(1.0, max_dimension / max(width, height))
+    long_side = max(width, height)
+    target_long = min(max_dimension, long_side)  # existing scale-down-only cap
+    if min_dimension is not None:
+        # Scale back UP to min_dimension if the source (or the already-
+        # capped target) is smaller than that — but min(...) here means
+        # this never pushes target_long past max_dimension even if
+        # min_dimension is misconfigured larger than it.
+        target_long = max(target_long, min(min_dimension, max_dimension))
+    scale = target_long / long_side
     target_w = width * scale
     target_h = height * scale
 
@@ -249,6 +295,111 @@ def _generate_removal_edit(job) -> bytes:
                 + (lama_status["load_error"] or "torch not installed — see requirements.txt")
             )
         image = lama(init_image, mask)
+
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _generate_kontext_edit(job) -> bytes:
+    """mode="img2img" WITHOUT remove_target, once FLUX.1 Kontext is
+    configured and enabled (config.KONTEXT_ENABLED, conf/models.py's
+    get_kontext_model()) — the experimental, general-purpose "smarter
+    fallback" for edit instructions plain img2img can't follow. Real,
+    reported failure this exists to fix: "redraw this photo as if she
+    were a man" came back essentially unchanged through plain img2img —
+    a low-strength denoise-from-image guided by a text prompt describing
+    the destination picture has no way to express "apply this specific
+    semantic transformation" the way a real instruction-following edit
+    model does.
+
+    Takes over EVERY non-removal edit job automatically once configured —
+    no main-app changes needed at all, since the prompt/init_image a
+    plain img2img job already carries (see routes/chat.py's
+    _handle_image_edit_request on the main app side) is exactly what
+    Kontext needs too; this function only fires when
+    get_kontext_model() actually returns a loaded model, so with
+    KONTEXT_ENABLED left at its default (false) or the model files
+    missing, every edit job falls straight through to the unchanged
+    _generate() path below.
+
+    Uses `ref_images` (NOT `init_image`/`strength`) — confirmed by
+    reading stable-diffusion-cpp-python's own generate_image
+    implementation: `ref_images` is the Kontext-specific image-
+    conditioning channel (resized internally by stable-diffusion.cpp,
+    distinct from init_image's strength-blended denoise-from-noised-
+    latent img2img path, which Kontext doesn't use — passing an image via
+    init_image instead would silently engage the wrong mechanism). Also
+    uses `guidance` instead of `cfg_scale`: Flux is guidance-distilled
+    rather than classifier-free-guided the SD1.x way, and
+    stable-diffusion-cpp-python exposes these as genuinely separate
+    parameters.
+
+    Resolution: capped via the same _fit_gen_size helper
+    _generate_removal_edit uses above (config.KONTEXT_MAX_DIMENSION
+    instead of RECONSTRUCT_MAX_DIMENSION) — applied proactively here
+    rather than waiting to rediscover the exact out-of-memory crash
+    _generate_removal_edit's own history already went through, since a
+    12B-parameter diffusion transformer's memory scaling is at least as
+    steep as SD1.x's ~1B-parameter UNet.
+
+    ALSO capped from BELOW via config.KONTEXT_MIN_DIMENSION (a real,
+    reported bug, fixed here): a small 256x198 source photo produced an
+    edit that came back identical to the input — confirmed to be a
+    resolution problem, not a prompt/parameter one, by re-testing at
+    2048x1536 (which _fit_gen_size's existing max_dimension step alone
+    naturally scales down to Kontext's own ~1-megapixel training
+    resolution) and getting a correct, real edit. FLUX/Kontext is a
+    patch-based diffusion transformer trained at roughly 1024x1024-class
+    resolutions; fed a much smaller image, the latent grid is too small
+    for it to encode a meaningful edit at all, so it collapses toward
+    reproducing the (strongly-conditioning) reference almost unchanged.
+    _fit_gen_size's min_dimension parameter scales SMALL source photos
+    back UP (never past KONTEXT_MAX_DIMENSION) to give the transformer a
+    properly-sized latent grid to work with, same as it already scales
+    large ones down. See config.KONTEXT_MIN_DIMENSION's own comment for
+    the real compute-time cost this trades off against.
+    """
+    from PIL import Image
+
+    if not job["init_image"]:
+        raise RuntimeError("mode='img2img' Kontext edit requires init_image")
+
+    kontext = models.get_kontext_model()
+    if kontext is None:
+        status = models.kontext_status()
+        raise RuntimeError(
+            "FLUX.1 Kontext unavailable: "
+            + (status["load_error"] or "not configured — see README.md")
+        )
+
+    init_image = Image.open(io.BytesIO(job["init_image"])).convert("RGB")
+    original_size = init_image.size
+    gen_width, gen_height = _fit_gen_size(
+        *original_size, config.KONTEXT_MAX_DIMENSION, min_dimension=config.KONTEXT_MIN_DIMENSION
+    )
+    ref_image = (
+        init_image if (gen_width, gen_height) == original_size else init_image.resize((gen_width, gen_height))
+    )
+
+    kwargs = dict(
+        prompt=job["prompt"],
+        ref_images=[ref_image],
+        width=gen_width,
+        height=gen_height,
+        guidance=config.KONTEXT_GUIDANCE,
+        cfg_scale=config.KONTEXT_CFG_SCALE,
+        sample_steps=job["steps"],
+    )
+    if job["negative_prompt"]:
+        kwargs["negative_prompt"] = job["negative_prompt"]
+    if job["seed"] is not None:
+        kwargs["seed"] = job["seed"]
+
+    output = kontext.generate_image(**kwargs)
+    image = output[0]
+    if image.size != original_size:
+        image = image.resize(original_size)
 
     buf = io.BytesIO()
     image.save(buf, format="PNG")
